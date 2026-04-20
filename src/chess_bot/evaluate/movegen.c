@@ -405,72 +405,107 @@ static void init_magic_tables(void) {
     }
 }
 
-static U64 bishop_attacks_magic(int sq, U64 occupied) {
-    U64 occ = occupied & g_bishop_masks[sq];
-    int idx = (int)((occ * g_bishop_magics[sq]) >> (64 - g_bishop_bits[sq]));
-    return g_bishop_attacks[sq][idx];
-}
-
-static U64 rook_attacks_magic(int sq, U64 occupied) {
-    U64 occ = occupied & g_rook_masks[sq];
-    int idx = (int)((occ * g_rook_magics[sq]) >> (64 - g_rook_bits[sq]));
-    return g_rook_attacks[sq][idx];
-}
-
-static int bitboard_contains_piece(const char *board, U64 bb, char piece_a, char piece_b) {
-    while (bb) {
-        int sq = lsb_index64(bb);
-        bb &= (bb - 1ULL);
-
-        char p = board[sq];
-        if (p == piece_a || p == piece_b) {
-            return 1;
-        }
-    }
-
-    return 0;
-}
-
 static int is_square_attacked(const char *board, int target_sq, int attacker_white) {
-    U64 occupied = 0ULL;
+    int row = target_sq / 8;
+    int col = target_sq % 8;
 
-    for (int sq = 0; sq < 64; ++sq) {
-        if (board[sq] != ' ') {
-            occupied |= BB(sq);
-        }
-    }
+    char pawn = attacker_white ? 'P' : 'p';
+    char knight = attacker_white ? 'N' : 'n';
+    char bishop = attacker_white ? 'B' : 'b';
+    char rook = attacker_white ? 'R' : 'r';
+    char queen = attacker_white ? 'Q' : 'q';
+    char king = attacker_white ? 'K' : 'k';
 
     if (attacker_white) {
-        if (bitboard_contains_piece(board, g_pawn_attackers[0][target_sq], 'P', '\0')) {
-            return 1;
-        }
-        if (bitboard_contains_piece(board, g_knight_attacks[target_sq], 'N', '\0')) {
-            return 1;
-        }
-        if (bitboard_contains_piece(board, bishop_attacks_magic(target_sq, occupied), 'B', 'Q')) {
-            return 1;
-        }
-        if (bitboard_contains_piece(board, rook_attacks_magic(target_sq, occupied), 'R', 'Q')) {
-            return 1;
-        }
-        if (bitboard_contains_piece(board, g_king_attacks[target_sq], 'K', '\0')) {
-            return 1;
+        int rr = row + 1;
+        if (rr < 8) {
+            if (col > 0 && board[(rr * 8) + (col - 1)] == pawn) {
+                return 1;
+            }
+            if (col < 7 && board[(rr * 8) + (col + 1)] == pawn) {
+                return 1;
+            }
         }
     } else {
-        if (bitboard_contains_piece(board, g_pawn_attackers[1][target_sq], 'p', '\0')) {
+        int rr = row - 1;
+        if (rr >= 0) {
+            if (col > 0 && board[(rr * 8) + (col - 1)] == pawn) {
+                return 1;
+            }
+            if (col < 7 && board[(rr * 8) + (col + 1)] == pawn) {
+                return 1;
+            }
+        }
+    }
+
+    static const int knight_dr[8] = {-2, -2, -1, -1, 1, 1, 2, 2};
+    static const int knight_dc[8] = {-1, 1, -2, 2, -2, 2, -1, 1};
+    for (int i = 0; i < 8; ++i) {
+        int rr = row + knight_dr[i];
+        int cc = col + knight_dc[i];
+        if (!on_board(rr, cc)) {
+            continue;
+        }
+        if (board[(rr * 8) + cc] == knight) {
             return 1;
         }
-        if (bitboard_contains_piece(board, g_knight_attacks[target_sq], 'n', '\0')) {
-            return 1;
+    }
+
+    static const int bishop_dr[4] = {-1, -1, 1, 1};
+    static const int bishop_dc[4] = {-1, 1, -1, 1};
+    for (int i = 0; i < 4; ++i) {
+        int rr = row + bishop_dr[i];
+        int cc = col + bishop_dc[i];
+
+        while (on_board(rr, cc)) {
+            char p = board[(rr * 8) + cc];
+            if (p != ' ') {
+                if (p == bishop || p == queen) {
+                    return 1;
+                }
+                break;
+            }
+
+            rr += bishop_dr[i];
+            cc += bishop_dc[i];
         }
-        if (bitboard_contains_piece(board, bishop_attacks_magic(target_sq, occupied), 'b', 'q')) {
-            return 1;
+    }
+
+    static const int rook_dr[4] = {-1, 1, 0, 0};
+    static const int rook_dc[4] = {0, 0, -1, 1};
+    for (int i = 0; i < 4; ++i) {
+        int rr = row + rook_dr[i];
+        int cc = col + rook_dc[i];
+
+        while (on_board(rr, cc)) {
+            char p = board[(rr * 8) + cc];
+            if (p != ' ') {
+                if (p == rook || p == queen) {
+                    return 1;
+                }
+                break;
+            }
+
+            rr += rook_dr[i];
+            cc += rook_dc[i];
         }
-        if (bitboard_contains_piece(board, rook_attacks_magic(target_sq, occupied), 'r', 'q')) {
-            return 1;
-        }
-        if (bitboard_contains_piece(board, g_king_attacks[target_sq], 'k', '\0')) {
-            return 1;
+    }
+
+    for (int dr = -1; dr <= 1; ++dr) {
+        for (int dc = -1; dc <= 1; ++dc) {
+            if (dr == 0 && dc == 0) {
+                continue;
+            }
+
+            int rr = row + dr;
+            int cc = col + dc;
+            if (!on_board(rr, cc)) {
+                continue;
+            }
+
+            if (board[(rr * 8) + cc] == king) {
+                return 1;
+            }
         }
     }
 

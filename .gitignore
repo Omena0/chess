@@ -1,3 +1,5 @@
 *.o
 build
 .vscode
+.pgo-data
+gmon.out

@@ -183,7 +183,7 @@ static int move_is_valid(ChessMove m) {
     return m.from >= 0 && m.from < 64 && m.to >= 0 && m.to < 64 && m.from != m.to;
 }
 
-static int side_piece_count(const ChessPosition *pos, char side) {
+static int side_piece_count_at_least(const ChessPosition *pos, char side, int threshold) {
     int count = 0;
     for (int i = 0; i < 64; ++i) {
         char p = pos->board[i];
@@ -194,24 +194,24 @@ static int side_piece_count(const ChessPosition *pos, char side) {
         if (side == 'w') {
             if (p >= 'A' && p <= 'Z') {
                 count += 1;
+                if (count >= threshold) {
+                    return 1;
+                }
             }
         } else {
             if (p >= 'a' && p <= 'z') {
                 count += 1;
+                if (count >= threshold) {
+                    return 1;
+                }
             }
         }
     }
 
-    return count;
+    return 0;
 }
 
 static int insufficient_material(const ChessPosition *pos) {
-    int white_pawns = 0;
-    int black_pawns = 0;
-    int white_rooks = 0;
-    int black_rooks = 0;
-    int white_queens = 0;
-    int black_queens = 0;
     int white_bishops = 0;
     int black_bishops = 0;
     int white_knights = 0;
@@ -221,23 +221,12 @@ static int insufficient_material(const ChessPosition *pos) {
         char p = pos->board[i];
         switch (p) {
             case 'P':
-                white_pawns += 1;
-                break;
             case 'p':
-                black_pawns += 1;
-                break;
             case 'R':
-                white_rooks += 1;
-                break;
             case 'r':
-                black_rooks += 1;
-                break;
             case 'Q':
-                white_queens += 1;
-                break;
             case 'q':
-                black_queens += 1;
-                break;
+                return 0;
             case 'B':
                 white_bishops += 1;
                 break;
@@ -253,10 +242,6 @@ static int insufficient_material(const ChessPosition *pos) {
             default:
                 break;
         }
-    }
-
-    if ((white_pawns + black_pawns + white_rooks + black_rooks + white_queens + black_queens) > 0) {
-        return 0;
     }
 
     int white_minors = white_bishops + white_knights;
@@ -1323,7 +1308,7 @@ static int negamax(
         static_eval_ready &&
         static_eval >= (beta - (90 + (search_depth * 12))) &&
         beta < MATE_PRIORITY_THRESHOLD &&
-        side_piece_count(pos, pos->side) > 4 &&
+        side_piece_count_at_least(pos, pos->side, 5) &&
         has_non_pawn_material(pos)) {
         ChessPosition null_pos = *pos;
         null_pos.side = (pos->side == 'w') ? 'b' : 'w';
