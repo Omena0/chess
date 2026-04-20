@@ -21,6 +21,7 @@
 #define MATE_SCORE 300000
 #define MATE_PRIORITY_THRESHOLD (MATE_SCORE - 2048)
 #define SEARCH_MAX_WORKERS 64
+#define SEARCH_SHARED_QUEUE_CAPACITY 255
 #define TT_MIN_CAPACITY 4096
 #define TT_MAX_CAPACITY 20000000
 
@@ -32,7 +33,17 @@ typedef struct {
     ChessMove move;
     int score;
     uint8_t is_capture;
+    uint8_t gives_check;
 } OrderedMove;
+
+typedef struct {
+    ChessPosition pos;
+    ChessMove root_move;
+    int depth;
+    int ply;
+    int root_order;
+    uint8_t is_root_task;
+} SharedQueueTask;
 
 typedef struct {
     uint64_t key;
@@ -73,12 +84,19 @@ typedef struct {
     ChessMove killers_seed[64][2];
     int history_seed[64][64];
 
+    SharedQueueTask tasks[SEARCH_SHARED_QUEUE_CAPACITY];
+    int task_count;
+    int root_task_count;
+
     _Atomic int next_task;
     _Atomic int stop;
+    _Atomic int shared_alpha;
+    _Atomic int root_tasks_done;
 
     int best_set;
     int best_score;
     ChessMove best_move;
+    int aborted;
 
     long total_nodes;
     pthread_mutex_t result_lock;
@@ -113,6 +131,12 @@ static size_t g_tt_capacity = 0;
 static pthread_mutex_t g_tt_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static pthread_once_t g_rng_once = PTHREAD_ONCE_INIT;
+static pthread_once_t g_zobrist_once = PTHREAD_ONCE_INIT;
+
+static uint64_t g_zobrist_piece[12][64];
+static uint64_t g_zobrist_side;
+static uint64_t g_zobrist_castle[16];
+static uint64_t g_zobrist_ep[9];
 
 static int clamp_i(int value, int min_value, int max_value) {
     if (value < min_value) {
@@ -140,22 +164,120 @@ static int lmr_reduction_for(int depth, int move_index) {
     int reduction = 0;
 
     if (depth >= 4 && move_index >= 3) {
-        reduction = 1;
+        reduction += 1;
     }
     if (depth >= 6 && move_index >= 5) {
-        reduction = 2;
+        reduction += 1;
     }
     if (depth >= 8 && move_index >= 8) {
-        reduction = 3;
+        reduction += 1;
     }
     if (depth >= 10 && move_index >= 12) {
-        reduction = 4;
+        reduction += 1;
     }
-    if (depth >= 14 && move_index >= 20) {
-        reduction = 5;
+    if (depth >= 12 && move_index >= 18) {
+        reduction += 1;
+    }
+    if (depth >= 16 && move_index >= 26) {
+        reduction += 1;
+    }
+    if (depth >= 20 && move_index >= 36) {
+        reduction += 1;
+    }
+
+    if (reduction > (depth - 2)) {
+        reduction = depth - 2;
+    }
+    if (reduction < 0) {
+        reduction = 0;
     }
 
     return reduction;
+}
+
+static uint64_t splitmix64_next(uint64_t *state) {
+    uint64_t z = (*state += 0x9e3779b97f4a7c15ULL);
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+    return z ^ (z >> 31);
+}
+
+static int piece_to_zobrist_index(char piece) {
+    switch (piece) {
+        case 'P':
+            return 0;
+        case 'N':
+            return 1;
+        case 'B':
+            return 2;
+        case 'R':
+            return 3;
+        case 'Q':
+            return 4;
+        case 'K':
+            return 5;
+        case 'p':
+            return 6;
+        case 'n':
+            return 7;
+        case 'b':
+            return 8;
+        case 'r':
+            return 9;
+        case 'q':
+            return 10;
+        case 'k':
+            return 11;
+        default:
+            return -1;
+    }
+}
+
+static int castling_mask(const ChessPosition *pos) {
+    if (pos->rights[0] == '-') {
+        return 0;
+    }
+
+    int mask = 0;
+    for (int i = 0; i < 5 && pos->rights[i] != '\0'; ++i) {
+        switch (pos->rights[i]) {
+            case 'K':
+                mask |= 1;
+                break;
+            case 'Q':
+                mask |= 2;
+                break;
+            case 'k':
+                mask |= 4;
+                break;
+            case 'q':
+                mask |= 8;
+                break;
+            default:
+                break;
+        }
+    }
+    return mask;
+}
+
+static void init_zobrist_once(void) {
+    uint64_t seed = 0x6a09e667f3bcc909ULL;
+
+    for (int p = 0; p < 12; ++p) {
+        for (int sq = 0; sq < 64; ++sq) {
+            g_zobrist_piece[p][sq] = splitmix64_next(&seed);
+        }
+    }
+
+    g_zobrist_side = splitmix64_next(&seed);
+
+    for (int i = 0; i < 16; ++i) {
+        g_zobrist_castle[i] = splitmix64_next(&seed);
+    }
+
+    for (int i = 0; i < 9; ++i) {
+        g_zobrist_ep[i] = splitmix64_next(&seed);
+    }
 }
 
 static void seed_rng_once(void) {
@@ -163,33 +285,29 @@ static void seed_rng_once(void) {
     srand(seed);
 }
 
-static uint64_t fnv_mix(uint64_t h, uint8_t b) {
-    h ^= (uint64_t)b;
-    h *= 1099511628211ULL;
-    return h;
-}
-
 static uint64_t hash_position(const ChessPosition *pos) {
-    uint64_t h = 1469598103934665603ULL;
+    pthread_once(&g_zobrist_once, init_zobrist_once);
 
+    uint64_t h = 0ULL;
     for (int i = 0; i < 64; ++i) {
-        h = fnv_mix(h, (uint8_t)pos->board[i]);
+        int piece_idx = piece_to_zobrist_index(pos->board[i]);
+        if (piece_idx >= 0) {
+            h ^= g_zobrist_piece[piece_idx][i];
+        }
     }
 
-    h = fnv_mix(h, (uint8_t)pos->side);
-
-    for (int i = 0; i < 5; ++i) {
-        h = fnv_mix(h, (uint8_t)pos->rights[i]);
+    if (pos->side == 'b') {
+        h ^= g_zobrist_side;
     }
 
-    int ep = pos->en_passant + 1;
-    h = fnv_mix(h, (uint8_t)(ep & 0xFF));
-    h = fnv_mix(h, (uint8_t)((ep >> 8) & 0xFF));
+    int castle = castling_mask(pos);
+    h ^= g_zobrist_castle[castle & 0x0F];
 
-    h = fnv_mix(h, (uint8_t)(pos->halfmove & 0xFF));
-    h = fnv_mix(h, (uint8_t)((pos->halfmove >> 8) & 0xFF));
-    h = fnv_mix(h, (uint8_t)(pos->fullmove & 0xFF));
-    h = fnv_mix(h, (uint8_t)((pos->fullmove >> 8) & 0xFF));
+    int ep_file = 8;
+    if (pos->en_passant >= 0 && pos->en_passant < 64) {
+        ep_file = pos->en_passant % 8;
+    }
+    h ^= g_zobrist_ep[ep_file];
 
     return h;
 }
@@ -276,9 +394,41 @@ static int tt_probe(uint64_t key, TTEntry *out_entry) {
     }
 
     size_t idx = (size_t)(key % g_tt_capacity);
+    size_t alt = idx;
+    if (g_tt_capacity > 1) {
+        uint64_t mix = key ^ (key >> 33) ^ 0xff51afd7ed558ccdULL;
+        size_t step = (size_t)((mix | 1ULL) % g_tt_capacity);
+        if (step == 0) {
+            step = 1;
+        }
+        alt = (idx + step) % g_tt_capacity;
+    }
+
     TTSlot *slot = &g_tt[idx];
 
     uint64_t key1 = atomic_load_explicit(&slot->key, memory_order_acquire);
+    if (key1 == key && key1 != 0ULL) {
+        uint64_t meta = atomic_load_explicit(&slot->meta, memory_order_relaxed);
+        uint64_t key2 = atomic_load_explicit(&slot->key, memory_order_acquire);
+        if (key1 == key2 && key2 == key) {
+            TTEntry entry;
+            entry.key = key;
+            tt_unpack_meta(meta, &entry);
+            if (entry.used) {
+                if (out_entry != NULL) {
+                    *out_entry = entry;
+                }
+                return 1;
+            }
+        }
+    }
+
+    if (alt == idx) {
+        return 0;
+    }
+
+    slot = &g_tt[alt];
+    key1 = atomic_load_explicit(&slot->key, memory_order_acquire);
     if (key1 != key || key1 == 0ULL) {
         return 0;
     }
@@ -309,22 +459,84 @@ static void tt_store(uint64_t key, int depth, int score, int flag, ChessMove bes
     }
 
     size_t idx = (size_t)(key % g_tt_capacity);
-    TTSlot *slot = &g_tt[idx];
+    size_t alt = idx;
+    if (g_tt_capacity > 1) {
+        uint64_t mix = key ^ (key >> 33) ^ 0xff51afd7ed558ccdULL;
+        size_t step = (size_t)((mix | 1ULL) % g_tt_capacity);
+        if (step == 0) {
+            step = 1;
+        }
+        alt = (idx + step) % g_tt_capacity;
+    }
 
-    uint64_t old_key = atomic_load_explicit(&slot->key, memory_order_acquire);
-    uint64_t old_meta = atomic_load_explicit(&slot->meta, memory_order_relaxed);
+    TTSlot *primary = &g_tt[idx];
+    TTSlot *secondary = &g_tt[alt];
 
-    TTEntry old_entry;
-    tt_unpack_meta(old_meta, &old_entry);
+    uint64_t key_a = atomic_load_explicit(&primary->key, memory_order_acquire);
+    uint64_t meta_a = atomic_load_explicit(&primary->meta, memory_order_relaxed);
+    TTEntry entry_a;
+    tt_unpack_meta(meta_a, &entry_a);
 
-    int replace = (!old_entry.used || old_key == key || depth >= old_entry.depth || flag == TT_EXACT);
-    if (!replace) {
+    if (key_a == key && entry_a.used) {
+        if (entry_a.depth > depth && flag != TT_EXACT) {
+            return;
+        }
+
+        uint64_t new_meta = tt_pack_meta(depth, score, flag, best_move, 1);
+        atomic_store_explicit(&primary->meta, new_meta, memory_order_relaxed);
+        atomic_store_explicit(&primary->key, key, memory_order_release);
+        return;
+    }
+
+    uint64_t key_b = key_a;
+    uint64_t meta_b = meta_a;
+    TTEntry entry_b = entry_a;
+    if (alt != idx) {
+        key_b = atomic_load_explicit(&secondary->key, memory_order_acquire);
+        meta_b = atomic_load_explicit(&secondary->meta, memory_order_relaxed);
+        tt_unpack_meta(meta_b, &entry_b);
+
+        if (key_b == key && entry_b.used) {
+            if (entry_b.depth > depth && flag != TT_EXACT) {
+                return;
+            }
+
+            uint64_t new_meta = tt_pack_meta(depth, score, flag, best_move, 1);
+            atomic_store_explicit(&secondary->meta, new_meta, memory_order_relaxed);
+            atomic_store_explicit(&secondary->key, key, memory_order_release);
+            return;
+        }
+    }
+
+    TTSlot *target = primary;
+    uint64_t target_key = key_a;
+    TTEntry target_entry = entry_a;
+
+    if (!entry_a.used || key_a == 0ULL) {
+        target = primary;
+        target_key = key_a;
+        target_entry = entry_a;
+    } else if (alt != idx && (!entry_b.used || key_b == 0ULL)) {
+        target = secondary;
+        target_key = key_b;
+        target_entry = entry_b;
+    } else if (alt != idx) {
+        int score_a = (entry_a.depth * 4) + ((entry_a.flag == TT_EXACT) ? 6 : 0);
+        int score_b = (entry_b.depth * 4) + ((entry_b.flag == TT_EXACT) ? 6 : 0);
+        if (score_b < score_a) {
+            target = secondary;
+            target_key = key_b;
+            target_entry = entry_b;
+        }
+    }
+
+    if (target_entry.used && target_key != key && target_entry.depth > depth && flag != TT_EXACT) {
         return;
     }
 
     uint64_t new_meta = tt_pack_meta(depth, score, flag, best_move, 1);
-    atomic_store_explicit(&slot->meta, new_meta, memory_order_relaxed);
-    atomic_store_explicit(&slot->key, key, memory_order_release);
+    atomic_store_explicit(&target->meta, new_meta, memory_order_relaxed);
+    atomic_store_explicit(&target->key, key, memory_order_release);
 }
 
 static int tt_best_move_for_position(const ChessPosition *pos, ChessMove *out_move) {
@@ -556,10 +768,12 @@ static void order_moves(
         ChessMove move = list->moves[i];
         int score = history_scores[i];
         int capture = 0;
+        int gives_check_flag = 0;
 
         if (rc >= 0) {
             score = scores[i];
             capture = (int)is_capture[i];
+            gives_check_flag = (int)gives_check[i];
         } else {
             capture = is_capture_move(pos, move);
 
@@ -594,6 +808,7 @@ static void order_moves(
         ordered[i].move = move;
         ordered[i].score = score;
         ordered[i].is_capture = (uint8_t)(capture ? 1 : 0);
+        ordered[i].gives_check = (uint8_t)(gives_check_flag ? 1 : 0);
     }
 
     for (int i = 1; i < list->count; ++i) {
@@ -636,6 +851,33 @@ static int quiescence(
         return alpha;
     }
 
+    int alpha_orig = alpha;
+    int beta_orig = beta;
+
+    uint64_t key = hash_position(pos);
+    TTEntry tt_entry;
+    ChessMove tt_move;
+    int has_tt_move = 0;
+    if (tt_probe(key, &tt_entry)) {
+        has_tt_move = 1;
+        tt_move = tt_entry.best_move;
+        if (tt_entry.depth <= 0) {
+            int tt_score = tt_decode_score(tt_entry.score, ply);
+            if (tt_entry.flag == TT_EXACT) {
+                return tt_score;
+            }
+            if (tt_entry.flag == TT_LOWER && tt_score > alpha) {
+                alpha = tt_score;
+            }
+            if (tt_entry.flag == TT_UPPER && tt_score < beta) {
+                beta = tt_score;
+            }
+            if (alpha >= beta) {
+                return tt_score;
+            }
+        }
+    }
+
     ChessMoveList legal;
     if (eval_helpers_get_moves(pos, &legal) < 0) {
         legal.count = 0;
@@ -649,13 +891,13 @@ static int quiescence(
         }
         return 0;
     }
-
     if (ply >= 96) {
         return evaluate_eval_position(pos, &legal);
     }
 
-    int stand_pat = evaluate_eval_position(pos, &legal);
+    int stand_pat = -MATE_SCORE;
     if (!in_check) {
+        stand_pat = evaluate_eval_position(pos, &legal);
         if (stand_pat >= beta) {
             return stand_pat;
         }
@@ -664,13 +906,20 @@ static int quiescence(
         }
     }
 
+    int best_score = alpha;
     OrderedMove ordered[CHESS_BOT_MAX_MOVES];
-    order_moves(pos, &legal, state, ply, NULL, ordered);
+    order_moves(pos, &legal, state, ply, has_tt_move ? &tt_move : NULL, ordered);
+
+    ChessMove local_best = ordered[0].move;
+    int best_set = 0;
+
+    int allow_quiet_checks = (!in_check && ply <= 0) ? 1 : 0;
 
     for (int i = 0; i < legal.count; ++i) {
         ChessMove move = ordered[i].move;
+        int is_quiet = (!ordered[i].is_capture && move.promo == '\0');
 
-        if (!in_check && !ordered[i].is_capture && move.promo == '\0') {
+        if (!in_check && is_quiet && !allow_quiet_checks) {
             continue;
         }
 
@@ -682,7 +931,7 @@ static int quiescence(
             }
 
             int optimistic = stand_pat + eval_helpers_get_material(victim) + 90;
-            if (optimistic < alpha) {
+            if (optimistic <= alpha) {
                 continue;
             }
         }
@@ -692,18 +941,41 @@ static int quiescence(
             continue;
         }
 
+        if (!in_check && is_quiet) {
+            if (!search_native_in_check(&child)) {
+                continue;
+            }
+        }
+
         int score = -quiescence(&child, -beta, -alpha, state, ply + 1);
 
         if (state->stopped) {
             return 0;
         }
 
+        if (!best_set || score > best_score) {
+            best_set = 1;
+            best_score = score;
+            local_best = move;
+        }
+
         if (score >= beta) {
+            tt_store(key, 0, tt_encode_score(score, ply), TT_LOWER, move);
             return score;
         }
         if (score > alpha) {
             alpha = score;
         }
+    }
+
+    if (!state->stopped) {
+        int flag = TT_EXACT;
+        if (alpha <= alpha_orig) {
+            flag = TT_UPPER;
+        } else if (alpha >= beta_orig) {
+            flag = TT_LOWER;
+        }
+        tt_store(key, 0, tt_encode_score(alpha, ply), flag, best_set ? local_best : ordered[0].move);
     }
 
     return alpha;
@@ -716,7 +988,9 @@ static int negamax(
     int beta,
     SearchState *state,
     int ply,
-    ChessMove *best_move
+    ChessMove *best_move,
+    int parent_static_eval,
+    int allow_null
 ) {
     if (must_stop(state)) {
         state->stopped = 1;
@@ -791,38 +1065,42 @@ static int negamax(
 
     int search_depth = depth;
     if (in_check && search_depth < 63) {
-        /* One-ply check extension helps detect long forcing mates. */
         search_depth += 1;
     }
 
     int static_eval = 0;
     int static_eval_ready = 0;
+    int improving = 0;
+
+    if (!in_check) {
+        static_eval = evaluate_eval_position(pos, &legal);
+        static_eval_ready = 1;
+        if (parent_static_eval > -CHESS_BOT_INF / 2) {
+            improving = static_eval > parent_static_eval;
+        }
+    }
 
     if (!in_check &&
         !is_pv_node &&
         abs_i(alpha) < MATE_PRIORITY_THRESHOLD &&
         abs_i(beta) < MATE_PRIORITY_THRESHOLD) {
-        if (!static_eval_ready) {
-            static_eval = evaluate_eval_position(pos, &legal);
-            static_eval_ready = 1;
-        }
-
-        if (search_depth <= 5) {
-            int margin = 120 + (search_depth * 170);
+        if (search_depth <= 6) {
+            int margin = 130 + (search_depth * 145) + (improving ? 60 : 0);
             if (static_eval - margin >= beta) {
                 return static_eval;
             }
         }
 
-        if (search_depth <= 2) {
-            int razor_margin = 160 + (search_depth * 140);
+        if (search_depth <= 3) {
+            int razor_margin = 130 + (search_depth * 120);
             if (static_eval + razor_margin <= alpha) {
                 return quiescence(pos, alpha, beta, state, ply);
             }
         }
     }
 
-    if (!in_check &&
+    if (allow_null &&
+        !in_check &&
         !is_pv_node &&
         search_depth >= 3 &&
         beta < MATE_PRIORITY_THRESHOLD &&
@@ -836,7 +1114,10 @@ static int negamax(
         }
 
         int reduction = 2 + (search_depth / 4);
-        if (search_depth >= 8) {
+        if (search_depth >= 10) {
+            reduction += 1;
+        }
+        if (!improving) {
             reduction += 1;
         }
         int null_depth = search_depth - 1 - reduction;
@@ -852,7 +1133,9 @@ static int negamax(
             -beta + 1,
             state,
             ply + 1,
-            &null_best
+            &null_best,
+            static_eval_ready ? static_eval : parent_static_eval,
+            0
         );
 
         if (state->stopped) {
@@ -860,18 +1143,56 @@ static int negamax(
         }
 
         if (null_score >= beta && abs_i(null_score) < MATE_PRIORITY_THRESHOLD) {
-            return null_score;
+            if (search_depth >= 7) {
+                ChessMove verify_best;
+                int verify_depth = search_depth - 1 - reduction;
+                if (verify_depth < 0) {
+                    verify_depth = 0;
+                }
+
+                int verify_score = negamax(
+                    pos,
+                    verify_depth,
+                    beta - 1,
+                    beta,
+                    state,
+                    ply,
+                    &verify_best,
+                    parent_static_eval,
+                    0
+                );
+
+                if (state->stopped) {
+                    return 0;
+                }
+
+                if (verify_score >= beta) {
+                    return null_score;
+                }
+            } else {
+                return null_score;
+            }
         }
     }
 
-    if (!has_tt_move && is_pv_node && search_depth >= 7) {
-        int iid_depth = search_depth - 2;
+    if (!has_tt_move && search_depth >= 7) {
+        int iid_depth = search_depth - (is_pv_node ? 2 : 3);
         if (iid_depth < 1) {
             iid_depth = 1;
         }
 
         ChessMove iid_best = legal.moves[0];
-        (void)negamax(pos, iid_depth, alpha, beta, state, ply, &iid_best);
+        (void)negamax(
+            pos,
+            iid_depth,
+            alpha,
+            beta,
+            state,
+            ply,
+            &iid_best,
+            parent_static_eval,
+            1
+        );
         if (state->stopped) {
             return 0;
         }
@@ -890,6 +1211,7 @@ static int negamax(
     int best_score = -CHESS_BOT_INF;
     ChessMove local_best = ordered[0].move;
     int best_set = 0;
+    int child_parent_eval = static_eval_ready ? static_eval : parent_static_eval;
 
     for (int i = 0; i < legal.count; ++i) {
         int is_quiet = (!ordered[i].is_capture && ordered[i].move.promo == '\0');
@@ -897,8 +1219,8 @@ static int negamax(
 
         if (!in_check &&
             !is_pv_node &&
-            search_depth <= 3 &&
-            i >= (3 + (search_depth * 2)) &&
+            search_depth <= 4 &&
+            i >= (3 + (search_depth * (improving ? 2 : 3))) &&
             is_quiet &&
             abs_i(alpha) < MATE_PRIORITY_THRESHOLD) {
             if (!static_eval_ready) {
@@ -906,7 +1228,7 @@ static int negamax(
                 static_eval_ready = 1;
             }
 
-            int futility_margin = 95 + (search_depth * 120);
+            int futility_margin = 80 + (search_depth * 120) + (improving ? 50 : 0);
             if (static_eval + futility_margin <= alpha) {
                 continue;
             }
@@ -915,9 +1237,9 @@ static int negamax(
         if (!in_check &&
             !is_pv_node &&
             search_depth <= 8 &&
-            i >= (3 + (search_depth * 2)) &&
+            i >= (3 + (search_depth * (improving ? 2 : 3))) &&
             is_quiet &&
-            quiet_history <= 0 &&
+            quiet_history < -5000 &&
             abs_i(alpha) < MATE_PRIORITY_THRESHOLD) {
             continue;
         }
@@ -929,47 +1251,111 @@ static int negamax(
 
         ChessMove child_best;
         int new_depth = search_depth - 1;
+        int gives_check = (int)ordered[i].gives_check;
+        if (!gives_check && is_quiet && i < 8) {
+            gives_check = search_native_in_check(&child);
+        }
+
+        int extension = 0;
+        if (gives_check && search_depth >= 6 && i < 6) {
+            extension = 1;
+        }
+
+        int child_depth = new_depth + extension;
+        if (child_depth < 0) {
+            child_depth = 0;
+        }
+
         int score = 0;
 
         if (i == 0) {
-            score = -negamax(&child, new_depth, -beta, -alpha, state, ply + 1, &child_best);
+            score = -negamax(
+                &child,
+                child_depth,
+                -beta,
+                -alpha,
+                state,
+                ply + 1,
+                &child_best,
+                child_parent_eval,
+                1
+            );
         } else {
             int reduction = 0;
-            if (search_depth >= 4 &&
+            if (search_depth >= 3 &&
                 !is_pv_node &&
                 !in_check &&
                 is_quiet &&
                 abs_i(alpha) < MATE_PRIORITY_THRESHOLD &&
                 abs_i(beta) < MATE_PRIORITY_THRESHOLD) {
                 reduction = lmr_reduction_for(search_depth, i);
-                if ((new_depth - reduction) < 0) {
-                    reduction = new_depth;
+                if (!improving) {
+                    reduction += 1;
+                }
+                if (quiet_history > 75000) {
+                    reduction -= 1;
+                }
+                if (gives_check) {
+                    reduction -= 1;
+                }
+                if ((child_depth - reduction) < 0) {
+                    reduction = child_depth;
                 }
                 if (reduction < 0) {
                     reduction = 0;
                 }
             }
 
-            int probe_depth = new_depth - reduction;
+            int probe_depth = child_depth - reduction;
             if (probe_depth < 0) {
                 probe_depth = 0;
             }
 
-            score = -negamax(&child, probe_depth, -alpha - 1, -alpha, state, ply + 1, &child_best);
+            score = -negamax(
+                &child,
+                probe_depth,
+                -alpha - 1,
+                -alpha,
+                state,
+                ply + 1,
+                &child_best,
+                child_parent_eval,
+                1
+            );
 
             if (state->stopped) {
                 break;
             }
 
             if (score > alpha && reduction > 0) {
-                score = -negamax(&child, new_depth, -alpha - 1, -alpha, state, ply + 1, &child_best);
+                score = -negamax(
+                    &child,
+                    child_depth,
+                    -alpha - 1,
+                    -alpha,
+                    state,
+                    ply + 1,
+                    &child_best,
+                    child_parent_eval,
+                    1
+                );
                 if (state->stopped) {
                     break;
                 }
             }
 
             if (score > alpha && score < beta) {
-                score = -negamax(&child, new_depth, -beta, -alpha, state, ply + 1, &child_best);
+                score = -negamax(
+                    &child,
+                    child_depth,
+                    -beta,
+                    -alpha,
+                    state,
+                    ply + 1,
+                    &child_best,
+                    child_parent_eval,
+                    1
+                );
             }
         }
 
@@ -1034,52 +1420,107 @@ static void root_queue_run_worker(RootQueueContext *ctx) {
     ChessMove local_best_move = ctx->ordered[0].move;
     int local_stop = 0;
 
+    long per_worker_limit = 0;
+    if (ctx->node_limit > 0) {
+        per_worker_limit = ctx->node_limit / ((ctx->worker_count > 0) ? ctx->worker_count : 1);
+        if (per_worker_limit < 1) {
+            per_worker_limit = 1;
+        }
+    }
+
     for (;;) {
         if (atomic_load_explicit(&ctx->stop, memory_order_relaxed)) {
             break;
         }
 
         int idx = atomic_fetch_add_explicit(&ctx->next_task, 1, memory_order_relaxed);
-        if (idx >= ctx->move_count) {
+        if (idx >= ctx->task_count) {
             break;
         }
 
-        OrderedMove current = ctx->ordered[idx];
-
-        ChessPosition child;
-        if (!chess_apply_move(ctx->root_pos, current.move, &child)) {
-            continue;
-        }
+        SharedQueueTask task = ctx->tasks[idx];
 
         SearchState local;
         memset(&local, 0, sizeof(local));
         local.start_ms = ctx->start_ms;
         local.soft_ms = 0;
         local.hard_ms = ctx->hard_ms;
-        local.node_limit = 0;
+        local.node_limit = per_worker_limit;
 
         memcpy(local.killers, ctx->killers_seed, sizeof(local.killers));
         memcpy(local.history, ctx->history_seed, sizeof(local.history));
 
-        if (ctx->node_limit > 0) {
-            long per_worker_limit = ctx->node_limit / ((ctx->worker_count > 0) ? ctx->worker_count : 1);
-            if (per_worker_limit < 1) {
-                per_worker_limit = 1;
-            }
-            local.node_limit = per_worker_limit;
-        }
-
         ChessMove child_best;
-        int score = -negamax(
-            &child,
-            ctx->depth - 1,
-            -CHESS_BOT_INF,
-            CHESS_BOT_INF,
-            &local,
-            1,
-            &child_best
-        );
-        score = apply_future_discount(score);
+
+        int score = 0;
+        if (task.is_root_task) {
+            int alpha_hint = atomic_load_explicit(&ctx->shared_alpha, memory_order_relaxed);
+
+            if (task.root_order == 0 || alpha_hint <= (-CHESS_BOT_INF / 2)) {
+                score = -negamax(
+                    &task.pos,
+                    task.depth,
+                    -CHESS_BOT_INF,
+                    CHESS_BOT_INF,
+                    &local,
+                    task.ply,
+                    &child_best,
+                    -CHESS_BOT_INF,
+                    1
+                );
+            } else {
+                score = -negamax(
+                    &task.pos,
+                    task.depth,
+                    -alpha_hint - 1,
+                    -alpha_hint,
+                    &local,
+                    task.ply,
+                    &child_best,
+                    -CHESS_BOT_INF,
+                    1
+                );
+
+                if (!local.stopped && score > alpha_hint) {
+                    score = -negamax(
+                        &task.pos,
+                        task.depth,
+                        -CHESS_BOT_INF,
+                        CHESS_BOT_INF,
+                        &local,
+                        task.ply,
+                        &child_best,
+                        -CHESS_BOT_INF,
+                        1
+                    );
+                }
+            }
+
+            score = apply_future_discount(score);
+            if (!local.stopped) {
+                int cur = atomic_load_explicit(&ctx->shared_alpha, memory_order_relaxed);
+                while (score > cur && !atomic_compare_exchange_weak_explicit(
+                    &ctx->shared_alpha,
+                    &cur,
+                    score,
+                    memory_order_release,
+                    memory_order_relaxed
+                )) {
+                }
+            }
+        } else {
+            (void)negamax(
+                &task.pos,
+                task.depth,
+                -CHESS_BOT_INF,
+                CHESS_BOT_INF,
+                &local,
+                task.ply,
+                &child_best,
+                -CHESS_BOT_INF,
+                1
+            );
+        }
 
         local_total_nodes += local.nodes;
 
@@ -1088,16 +1529,24 @@ static void root_queue_run_worker(RootQueueContext *ctx) {
             atomic_store_explicit(&ctx->stop, 1, memory_order_relaxed);
         }
 
-        if (!local_best_set || score > local_best_score) {
+        if (task.is_root_task && (!local_best_set || score > local_best_score)) {
             local_best_set = 1;
             local_best_score = score;
-            local_best_move = current.move;
+            local_best_move = task.root_move;
+        }
+
+        if (task.is_root_task) {
+            int done = atomic_fetch_add_explicit(&ctx->root_tasks_done, 1, memory_order_relaxed) + 1;
+            if (done >= ctx->root_task_count) {
+                atomic_store_explicit(&ctx->stop, 1, memory_order_relaxed);
+            }
         }
     }
 
     pthread_mutex_lock(&ctx->result_lock);
     ctx->total_nodes += local_total_nodes;
     if (local_stop) {
+        ctx->aborted = 1;
         atomic_store_explicit(&ctx->stop, 1, memory_order_relaxed);
     }
     if (local_best_set && (!ctx->best_set || local_best_score > ctx->best_score)) {
@@ -1106,6 +1555,151 @@ static void root_queue_run_worker(RootQueueContext *ctx) {
         ctx->best_move = local_best_move;
     }
     pthread_mutex_unlock(&ctx->result_lock);
+}
+
+static int root_queue_push_task(RootQueueContext *ctx, const SharedQueueTask *task) {
+    if (ctx->task_count >= SEARCH_SHARED_QUEUE_CAPACITY) {
+        return 0;
+    }
+
+    ctx->tasks[ctx->task_count++] = *task;
+    return 1;
+}
+
+static void root_queue_seed_tasks(RootQueueContext *ctx) {
+    ctx->task_count = 0;
+    ctx->root_task_count = 0;
+
+    for (int i = 0; i < ctx->move_count; ++i) {
+        ChessPosition child;
+        if (!chess_apply_move(ctx->root_pos, ctx->ordered[i].move, &child)) {
+            continue;
+        }
+
+        SharedQueueTask root_task;
+        memset(&root_task, 0, sizeof(root_task));
+        root_task.pos = child;
+        root_task.root_move = ctx->ordered[i].move;
+        root_task.depth = ctx->depth - 1;
+        if (root_task.depth < 0) {
+            root_task.depth = 0;
+        }
+        root_task.ply = 1;
+        root_task.root_order = i;
+        root_task.is_root_task = 1;
+
+        if (!root_queue_push_task(ctx, &root_task)) {
+            return;
+        }
+        ctx->root_task_count += 1;
+
+        if (ctx->task_count >= SEARCH_SHARED_QUEUE_CAPACITY) {
+            return;
+        }
+
+        if (ctx->depth < 3) {
+            continue;
+        }
+
+        ChessMoveList replies;
+        if (eval_helpers_get_moves(&child, &replies) < 0 || replies.count <= 0) {
+            continue;
+        }
+
+        SearchState warm_order_state;
+        memset(&warm_order_state, 0, sizeof(warm_order_state));
+        memcpy(warm_order_state.killers, ctx->killers_seed, sizeof(warm_order_state.killers));
+        memcpy(warm_order_state.history, ctx->history_seed, sizeof(warm_order_state.history));
+
+        OrderedMove ordered_replies[CHESS_BOT_MAX_MOVES];
+        order_moves(&child, &replies, &warm_order_state, 1, NULL, ordered_replies);
+
+        int warm_depth = (ctx->depth >= 8) ? 1 : 0;
+        int warm_per_root = 2;
+        if (ctx->depth >= 12) {
+            warm_per_root = 3;
+        }
+
+        for (int j = 0; j < replies.count && j < warm_per_root; ++j) {
+            ChessPosition grandchild;
+            if (!chess_apply_move(&child, ordered_replies[j].move, &grandchild)) {
+                continue;
+            }
+
+            SharedQueueTask warm_task;
+            memset(&warm_task, 0, sizeof(warm_task));
+            warm_task.pos = grandchild;
+            warm_task.root_move = ctx->ordered[i].move;
+            warm_task.depth = warm_depth;
+            warm_task.ply = 2;
+            warm_task.root_order = i;
+            warm_task.is_root_task = 0;
+
+            if (!root_queue_push_task(ctx, &warm_task)) {
+                return;
+            }
+        }
+    }
+
+    for (int round = 0; round < 8 && ctx->task_count < SEARCH_SHARED_QUEUE_CAPACITY; ++round) {
+        for (int i = 0; i < ctx->move_count && ctx->task_count < SEARCH_SHARED_QUEUE_CAPACITY; ++i) {
+            ChessPosition child;
+            if (!chess_apply_move(ctx->root_pos, ctx->ordered[i].move, &child)) {
+                continue;
+            }
+
+            ChessMoveList replies;
+            if (eval_helpers_get_moves(&child, &replies) < 0 || replies.count <= 0) {
+                continue;
+            }
+
+            SearchState warm_order_state;
+            memset(&warm_order_state, 0, sizeof(warm_order_state));
+            memcpy(warm_order_state.killers, ctx->killers_seed, sizeof(warm_order_state.killers));
+            memcpy(warm_order_state.history, ctx->history_seed, sizeof(warm_order_state.history));
+
+            OrderedMove ordered_replies[CHESS_BOT_MAX_MOVES];
+            order_moves(&child, &replies, &warm_order_state, 1, NULL, ordered_replies);
+
+            int start = 2 + (round * 2);
+            int end = start + 2;
+            for (int j = start; j < end && j < replies.count && ctx->task_count < SEARCH_SHARED_QUEUE_CAPACITY; ++j) {
+                ChessPosition grandchild;
+                if (!chess_apply_move(&child, ordered_replies[j].move, &grandchild)) {
+                    continue;
+                }
+
+                SharedQueueTask warm_task;
+                memset(&warm_task, 0, sizeof(warm_task));
+                warm_task.pos = grandchild;
+                warm_task.root_move = ctx->ordered[i].move;
+                warm_task.depth = 0;
+                warm_task.ply = 2;
+                warm_task.root_order = i;
+                warm_task.is_root_task = 0;
+
+                if (!root_queue_push_task(ctx, &warm_task)) {
+                    return;
+                }
+            }
+        }
+    }
+
+    int seed_count = ctx->task_count;
+    int cursor = 0;
+    while (ctx->task_count < SEARCH_SHARED_QUEUE_CAPACITY && seed_count > 0) {
+        SharedQueueTask padded = ctx->tasks[cursor % seed_count];
+        padded.is_root_task = 0;
+        padded.depth = 0;
+        if (padded.ply < 1) {
+            padded.ply = 1;
+        }
+
+        if (!root_queue_push_task(ctx, &padded)) {
+            break;
+        }
+        cursor += 1;
+    }
 }
 
 static void *root_queue_worker(void *arg) {
@@ -1134,13 +1728,22 @@ static int root_worker_queue_search(
     ctx.node_limit = state->node_limit;
     memcpy(ctx.killers_seed, state->killers, sizeof(ctx.killers_seed));
     memcpy(ctx.history_seed, state->history, sizeof(ctx.history_seed));
+
+    root_queue_seed_tasks(&ctx);
+    if (ctx.task_count <= 0 || ctx.root_task_count <= 0) {
+        *out_best = ordered[0].move;
+        return evaluate_eval_position(pos, NULL);
+    }
+
     atomic_init(&ctx.next_task, 0);
     atomic_init(&ctx.stop, 0);
+    atomic_init(&ctx.shared_alpha, -CHESS_BOT_INF);
+    atomic_init(&ctx.root_tasks_done, 0);
     pthread_mutex_init(&ctx.result_lock, NULL);
 
     int worker_count = g_worker_count;
-    if (worker_count > move_count) {
-        worker_count = move_count;
+    if (worker_count > ctx.task_count) {
+        worker_count = ctx.task_count;
     }
     worker_count = clamp_i(worker_count, 1, SEARCH_MAX_WORKERS);
     ctx.worker_count = worker_count;
@@ -1167,7 +1770,7 @@ static int root_worker_queue_search(
     pthread_mutex_destroy(&ctx.result_lock);
 
     state->nodes += ctx.total_nodes;
-    if (atomic_load_explicit(&ctx.stop, memory_order_relaxed)) {
+    if (ctx.aborted) {
         state->stopped = 1;
     }
 
@@ -1217,7 +1820,9 @@ static int root_search_sequential(
                 -alpha,
                 state,
                 1,
-                &child_best
+                &child_best,
+                -CHESS_BOT_INF,
+                1
             );
         } else {
             score = -negamax(
@@ -1227,7 +1832,9 @@ static int root_search_sequential(
                 -alpha,
                 state,
                 1,
-                &child_best
+                &child_best,
+                -CHESS_BOT_INF,
+                1
             );
 
             if (state->stopped) {
@@ -1242,7 +1849,9 @@ static int root_search_sequential(
                     -alpha,
                     state,
                     1,
-                    &child_best
+                    &child_best,
+                    -CHESS_BOT_INF,
+                    1
                 );
             }
         }
@@ -1499,14 +2108,15 @@ SearchResult search_iterative(
         int use_worker_queue = (
             g_worker_count > 1 &&
             root->count > 1 &&
-            depth >= 1
+            depth >= 6 &&
+            root->count >= clamp_i(g_worker_count / 2, 4, CHESS_BOT_MAX_MOVES)
         );
 
         int root_alpha = -CHESS_BOT_INF;
         int root_beta = CHESS_BOT_INF;
         int use_aspiration = (!use_worker_queue && result.depth > 0 && depth >= 3);
         if (use_aspiration) {
-            int aspiration = 28 + (depth * 12);
+            int aspiration = 22 + (depth * 10);
             root_alpha = result.score - aspiration;
             root_beta = result.score + aspiration;
         }
@@ -1518,7 +2128,7 @@ SearchResult search_iterative(
 
             if (!state.stopped && use_aspiration) {
                 int center = result.score;
-                int window = 28 + (depth * 12);
+                int window = 22 + (depth * 10);
                 int retries = 0;
 
                 while ((score <= root_alpha || score >= root_beta) && retries < 5 && !state.stopped) {
@@ -1612,5 +2222,5 @@ int search_search(
     state.hard_ms = 0;
     state.node_limit = 0;
 
-    return negamax(pos, depth, alpha, beta, &state, 0, best_move);
+    return negamax(pos, depth, alpha, beta, &state, 0, best_move, -CHESS_BOT_INF, 1);
 }

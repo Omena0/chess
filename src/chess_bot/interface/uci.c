@@ -1271,12 +1271,12 @@ static void go_cmd(char **tokens, int token_count) {
 void uci_loop(void) {
     chess_set_startpos(&g_position);
 
-    g_options.max_depth = 8;
+    g_options.max_depth = 20;
     g_options.hash_mb = search_get_hash_size_mb();
     g_options.ponder = 0;
     g_options.analyse_mode = 0;
     g_options.native_backend = search_native_backend_available() ? 1 : 0;
-    g_options.opening_randomness = 1;
+    g_options.opening_randomness = 0;
     g_options.move_overhead = 40;
     g_options.min_think_time = 20;
     g_options.workers = search_get_default_workers();
