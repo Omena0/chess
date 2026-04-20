@@ -20,6 +20,7 @@
 
 #define MATE_SCORE 300000
 #define MATE_PRIORITY_THRESHOLD (MATE_SCORE - 2048)
+#define DRAW_SCORE 0
 #define SEARCH_MAX_WORKERS 64
 #define SEARCH_SHARED_QUEUE_CAPACITY 255
 #define TT_MIN_CAPACITY 4096
@@ -69,6 +70,9 @@ typedef struct {
     long node_limit;
     ChessMove killers[64][2];
     int history[64][64];
+    ChessMove countermoves[64][64];
+    uint64_t rep_keys[256];
+    ChessMove move_stack[256];
 } SearchState;
 
 typedef struct {
@@ -83,6 +87,8 @@ typedef struct {
 
     ChessMove killers_seed[64][2];
     int history_seed[64][64];
+    ChessMove countermoves_seed[64][64];
+    uint64_t root_key;
 
     SharedQueueTask tasks[SEARCH_SHARED_QUEUE_CAPACITY];
     int task_count;
@@ -124,6 +130,7 @@ static volatile sig_atomic_t g_stop_requested = 0;
 
 static ChessMove g_global_killers[64][2];
 static int g_global_history[64][64];
+static ChessMove g_global_countermoves[64][64];
 static pthread_mutex_t g_state_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static TTSlot *g_tt = NULL;
@@ -158,6 +165,173 @@ static long now_ms(void) {
 
 static int abs_i(int v) {
     return (v < 0) ? -v : v;
+}
+
+static int min_i(int a, int b) {
+    return (a < b) ? a : b;
+}
+
+static ChessMove invalid_move(void) {
+    ChessMove m;
+    m.from = -1;
+    m.to = -1;
+    m.promo = '\0';
+    return m;
+}
+
+static int move_is_valid(ChessMove m) {
+    return m.from >= 0 && m.from < 64 && m.to >= 0 && m.to < 64 && m.from != m.to;
+}
+
+static int side_piece_count(const ChessPosition *pos, char side) {
+    int count = 0;
+    for (int i = 0; i < 64; ++i) {
+        char p = pos->board[i];
+        if (p == ' ') {
+            continue;
+        }
+
+        if (side == 'w') {
+            if (p >= 'A' && p <= 'Z') {
+                count += 1;
+            }
+        } else {
+            if (p >= 'a' && p <= 'z') {
+                count += 1;
+            }
+        }
+    }
+
+    return count;
+}
+
+static int insufficient_material(const ChessPosition *pos) {
+    int white_pawns = 0;
+    int black_pawns = 0;
+    int white_rooks = 0;
+    int black_rooks = 0;
+    int white_queens = 0;
+    int black_queens = 0;
+    int white_bishops = 0;
+    int black_bishops = 0;
+    int white_knights = 0;
+    int black_knights = 0;
+
+    for (int i = 0; i < 64; ++i) {
+        char p = pos->board[i];
+        switch (p) {
+            case 'P':
+                white_pawns += 1;
+                break;
+            case 'p':
+                black_pawns += 1;
+                break;
+            case 'R':
+                white_rooks += 1;
+                break;
+            case 'r':
+                black_rooks += 1;
+                break;
+            case 'Q':
+                white_queens += 1;
+                break;
+            case 'q':
+                black_queens += 1;
+                break;
+            case 'B':
+                white_bishops += 1;
+                break;
+            case 'b':
+                black_bishops += 1;
+                break;
+            case 'N':
+                white_knights += 1;
+                break;
+            case 'n':
+                black_knights += 1;
+                break;
+            default:
+                break;
+        }
+    }
+
+    if ((white_pawns + black_pawns + white_rooks + black_rooks + white_queens + black_queens) > 0) {
+        return 0;
+    }
+
+    int white_minors = white_bishops + white_knights;
+    int black_minors = black_bishops + black_knights;
+
+    if ((white_minors + black_minors) <= 1) {
+        return 1;
+    }
+
+    if (white_knights == 0 && black_knights == 0 && white_bishops <= 1 && black_bishops <= 1) {
+        return 1;
+    }
+
+    if (white_bishops == 0 && black_bishops == 0) {
+        if ((white_knights <= 2 && black_knights == 0) || (black_knights <= 2 && white_knights == 0)) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+static int is_repetition_draw(const SearchState *state, uint64_t key, int ply, int halfmove_clock) {
+    if (ply <= 1) {
+        return 0;
+    }
+
+    int max_back = min_i(ply, halfmove_clock);
+    int min_ply = ply - max_back;
+    if (min_ply < 0) {
+        min_ply = 0;
+    }
+
+    for (int i = ply - 2; i >= min_ply; i -= 2) {
+        if (state->rep_keys[i] == key) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+static void decay_history_table(SearchState *state) {
+    for (int from = 0; from < 64; ++from) {
+        for (int to = 0; to < 64; ++to) {
+            state->history[from][to] = (state->history[from][to] * 31) / 32;
+        }
+    }
+}
+
+static void boost_previous_best_root_move(OrderedMove *ordered, int count, ChessMove prev_best) {
+    if (!move_is_valid(prev_best) || count <= 1) {
+        return;
+    }
+
+    int idx = -1;
+    for (int i = 0; i < count; ++i) {
+        if (ordered[i].move.from == prev_best.from &&
+            ordered[i].move.to == prev_best.to &&
+            ordered[i].move.promo == prev_best.promo) {
+            idx = i;
+            break;
+        }
+    }
+    if (idx <= 0) {
+        return;
+    }
+
+    ordered[idx].score += 350000;
+    while (idx > 0 && ordered[idx].score > ordered[idx - 1].score) {
+        OrderedMove tmp = ordered[idx - 1];
+        ordered[idx - 1] = ordered[idx];
+        ordered[idx] = tmp;
+        idx -= 1;
+    }
 }
 
 static int lmr_reduction_for(int depth, int move_index) {
@@ -584,6 +758,7 @@ void search_clear_state(void) {
     pthread_mutex_lock(&g_state_lock);
     memset(g_global_killers, 0, sizeof(g_global_killers));
     memset(g_global_history, 0, sizeof(g_global_history));
+    memset(g_global_countermoves, 0, sizeof(g_global_countermoves));
     pthread_mutex_unlock(&g_state_lock);
 
     pthread_mutex_lock(&g_tt_lock);
@@ -748,6 +923,16 @@ static void order_moves(
     ChessMove *k1 = (ply < 64) ? &state->killers[ply][0] : NULL;
     ChessMove *k2 = (ply < 64) ? &state->killers[ply][1] : NULL;
 
+    ChessMove countermove = invalid_move();
+    int has_countermove = 0;
+    if (ply > 0) {
+        ChessMove prev = state->move_stack[ply - 1];
+        if (move_is_valid(prev)) {
+            countermove = state->countermoves[prev.from][prev.to];
+            has_countermove = move_is_valid(countermove);
+        }
+    }
+
     int rc = -1;
     if (g_native_backend_enabled) {
         rc = search_native_score_moves(
@@ -805,6 +990,10 @@ static void order_moves(
             }
         }
 
+        if (!capture && has_countermove && move_equal(countermove, move)) {
+            score += 105000;
+        }
+
         ordered[i].move = move;
         ordered[i].score = score;
         ordered[i].is_capture = (uint8_t)(capture ? 1 : 0);
@@ -855,6 +1044,18 @@ static int quiescence(
     int beta_orig = beta;
 
     uint64_t key = hash_position(pos);
+
+    if (pos->halfmove >= 100 || insufficient_material(pos)) {
+        return DRAW_SCORE;
+    }
+
+    if (ply < 256) {
+        if (is_repetition_draw(state, key, ply, pos->halfmove)) {
+            return DRAW_SCORE;
+        }
+        state->rep_keys[ply] = key;
+    }
+
     TTEntry tt_entry;
     ChessMove tt_move;
     int has_tt_move = 0;
@@ -913,13 +1114,13 @@ static int quiescence(
     ChessMove local_best = ordered[0].move;
     int best_set = 0;
 
-    int allow_quiet_checks = (!in_check && ply <= 0) ? 1 : 0;
+    int allow_quiet_checks = (!in_check && ply <= 1) ? 1 : 0;
 
     for (int i = 0; i < legal.count; ++i) {
         ChessMove move = ordered[i].move;
         int is_quiet = (!ordered[i].is_capture && move.promo == '\0');
 
-        if (!in_check && is_quiet && !allow_quiet_checks) {
+        if (!in_check && is_quiet && (!allow_quiet_checks || i >= 6)) {
             continue;
         }
 
@@ -939,6 +1140,10 @@ static int quiescence(
         ChessPosition child;
         if (!chess_apply_move(pos, move, &child)) {
             continue;
+        }
+
+        if (ply >= 0 && ply < 255) {
+            state->move_stack[ply] = move;
         }
 
         if (!in_check && is_quiet) {
@@ -1020,6 +1225,18 @@ static int negamax(
     int is_pv_node = (beta_orig - alpha_orig) > 1;
 
     uint64_t key = hash_position(pos);
+
+    if (pos->halfmove >= 100 || insufficient_material(pos)) {
+        return DRAW_SCORE;
+    }
+
+    if (ply < 256) {
+        if (is_repetition_draw(state, key, ply, pos->halfmove)) {
+            return DRAW_SCORE;
+        }
+        state->rep_keys[ply] = key;
+    }
+
     TTEntry tt_entry;
     ChessMove tt_move;
     int has_tt_move = 0;
@@ -1103,7 +1320,10 @@ static int negamax(
         !in_check &&
         !is_pv_node &&
         search_depth >= 3 &&
+        static_eval_ready &&
+        static_eval >= (beta - (90 + (search_depth * 12))) &&
         beta < MATE_PRIORITY_THRESHOLD &&
+        side_piece_count(pos, pos->side) > 4 &&
         has_non_pawn_material(pos)) {
         ChessPosition null_pos = *pos;
         null_pos.side = (pos->side == 'w') ? 'b' : 'w';
@@ -1114,11 +1334,24 @@ static int negamax(
         }
 
         int reduction = 2 + (search_depth / 4);
+        int eval_gap = static_eval - beta;
         if (search_depth >= 10) {
             reduction += 1;
         }
         if (!improving) {
             reduction += 1;
+        }
+        if (eval_gap > 120) {
+            reduction += 1;
+        }
+        if (eval_gap > 260) {
+            reduction += 1;
+        }
+        if (eval_gap < 0) {
+            reduction -= 1;
+        }
+        if (reduction < 1) {
+            reduction = 1;
         }
         int null_depth = search_depth - 1 - reduction;
         if (null_depth < 0) {
@@ -1126,6 +1359,9 @@ static int negamax(
         }
 
         ChessMove null_best;
+        if (ply >= 0 && ply < 255) {
+            state->move_stack[ply] = invalid_move();
+        }
         int null_score = -negamax(
             &null_pos,
             null_depth,
@@ -1212,6 +1448,17 @@ static int negamax(
     ChessMove local_best = ordered[0].move;
     int best_set = 0;
     int child_parent_eval = static_eval_ready ? static_eval : parent_static_eval;
+    int late_move_prune_index = 3 + (search_depth * (improving ? 2 : 3));
+    if (search_depth >= 8) {
+        late_move_prune_index += 2;
+    }
+
+    ChessMove prev_move = invalid_move();
+    int has_prev_move = 0;
+    if (ply > 0) {
+        prev_move = state->move_stack[ply - 1];
+        has_prev_move = move_is_valid(prev_move);
+    }
 
     for (int i = 0; i < legal.count; ++i) {
         int is_quiet = (!ordered[i].is_capture && ordered[i].move.promo == '\0');
@@ -1220,7 +1467,7 @@ static int negamax(
         if (!in_check &&
             !is_pv_node &&
             search_depth <= 4 &&
-            i >= (3 + (search_depth * (improving ? 2 : 3))) &&
+            i >= (2 + (search_depth * (improving ? 2 : 3))) &&
             is_quiet &&
             abs_i(alpha) < MATE_PRIORITY_THRESHOLD) {
             if (!static_eval_ready) {
@@ -1228,7 +1475,7 @@ static int negamax(
                 static_eval_ready = 1;
             }
 
-            int futility_margin = 80 + (search_depth * 120) + (improving ? 50 : 0);
+            int futility_margin = 70 + (search_depth * 110) + (improving ? 45 : 0) + (i * 8);
             if (static_eval + futility_margin <= alpha) {
                 continue;
             }
@@ -1237,9 +1484,9 @@ static int negamax(
         if (!in_check &&
             !is_pv_node &&
             search_depth <= 8 &&
-            i >= (3 + (search_depth * (improving ? 2 : 3))) &&
+            i >= late_move_prune_index &&
             is_quiet &&
-            quiet_history < -5000 &&
+            quiet_history < (improving ? -2000 : 8000) &&
             abs_i(alpha) < MATE_PRIORITY_THRESHOLD) {
             continue;
         }
@@ -1247,6 +1494,10 @@ static int negamax(
         ChessPosition child;
         if (!chess_apply_move(pos, ordered[i].move, &child)) {
             continue;
+        }
+
+        if (ply >= 0 && ply < 255) {
+            state->move_stack[ply] = ordered[i].move;
         }
 
         ChessMove child_best;
@@ -1375,6 +1626,11 @@ static int negamax(
 
         if (is_quiet && ply < 64 && score <= alpha_orig) {
             int hist = state->history[ordered[i].move.from][ordered[i].move.to] - search_depth;
+
+            if (has_prev_move && move_equal(state->countermoves[prev_move.from][prev_move.to], ordered[i].move)) {
+                hist -= search_depth;
+            }
+
             state->history[ordered[i].move.from][ordered[i].move.to] = clamp_i(hist, -2000000, 2000000);
         }
 
@@ -1387,6 +1643,10 @@ static int negamax(
 
                 int hist = state->history[ordered[i].move.from][ordered[i].move.to] + (search_depth * search_depth);
                 state->history[ordered[i].move.from][ordered[i].move.to] = clamp_i(hist, -2000000, 2000000);
+
+                if (has_prev_move) {
+                    state->countermoves[prev_move.from][prev_move.to] = ordered[i].move;
+                }
             }
             break;
         }
@@ -1446,9 +1706,12 @@ static void root_queue_run_worker(RootQueueContext *ctx) {
         local.soft_ms = 0;
         local.hard_ms = ctx->hard_ms;
         local.node_limit = per_worker_limit;
+        local.rep_keys[0] = ctx->root_key;
+        local.move_stack[0] = move_is_valid(task.root_move) ? task.root_move : invalid_move();
 
         memcpy(local.killers, ctx->killers_seed, sizeof(local.killers));
         memcpy(local.history, ctx->history_seed, sizeof(local.history));
+        memcpy(local.countermoves, ctx->countermoves_seed, sizeof(local.countermoves));
 
         ChessMove child_best;
 
@@ -1726,8 +1989,10 @@ static int root_worker_queue_search(
     ctx.start_ms = state->start_ms;
     ctx.hard_ms = state->hard_ms;
     ctx.node_limit = state->node_limit;
+    ctx.root_key = hash_position(pos);
     memcpy(ctx.killers_seed, state->killers, sizeof(ctx.killers_seed));
     memcpy(ctx.history_seed, state->history, sizeof(ctx.history_seed));
+    memcpy(ctx.countermoves_seed, state->countermoves, sizeof(ctx.countermoves_seed));
 
     root_queue_seed_tasks(&ctx);
     if (ctx.task_count <= 0 || ctx.root_task_count <= 0) {
@@ -1809,6 +2074,8 @@ static int root_search_sequential(
         if (!chess_apply_move(pos, ordered[i].move, &child)) {
             continue;
         }
+
+        state->move_stack[0] = ordered[i].move;
 
         ChessMove child_best;
         int score = 0;
@@ -2057,10 +2324,13 @@ SearchResult search_iterative(
     state.soft_ms = soft_time_ms;
     state.hard_ms = hard_time_ms;
     state.node_limit = (node_limit > 0) ? node_limit : 0;
+    state.rep_keys[0] = hash_position(pos);
+    state.move_stack[0] = invalid_move();
 
     pthread_mutex_lock(&g_state_lock);
     memcpy(state.killers, g_global_killers, sizeof(state.killers));
     memcpy(state.history, g_global_history, sizeof(state.history));
+    memcpy(state.countermoves, g_global_countermoves, sizeof(state.countermoves));
     pthread_mutex_unlock(&g_state_lock);
 
     ChessMoveList generated_root;
@@ -2094,6 +2364,10 @@ SearchResult search_iterative(
             break;
         }
 
+        if (depth > 1 && (depth % 2) == 0) {
+            decay_history_table(&state);
+        }
+
         OrderedMove ordered[CHESS_BOT_MAX_MOVES];
         ChessMove root_tt_move;
         ChessMove *root_tt_move_ptr = NULL;
@@ -2101,6 +2375,9 @@ SearchResult search_iterative(
             root_tt_move_ptr = &root_tt_move;
         }
         order_moves(pos, root, &state, 0, root_tt_move_ptr, ordered);
+        if (depth > 1) {
+            boost_previous_best_root_move(ordered, root->count, result.best_move);
+        }
 
         ChessMove best;
         int score;
@@ -2177,6 +2454,10 @@ SearchResult search_iterative(
             info_callback(&result, info_user_data);
         }
 
+        if (abs_i(result.score) >= (MATE_SCORE - 256) && depth >= 8) {
+            break;
+        }
+
         if (state.soft_ms > 0 && elapsed >= state.soft_ms) {
             break;
         }
@@ -2195,6 +2476,7 @@ SearchResult search_iterative(
 
     pthread_mutex_lock(&g_state_lock);
     memcpy(g_global_killers, state.killers, sizeof(g_global_killers));
+    memcpy(g_global_countermoves, state.countermoves, sizeof(g_global_countermoves));
     for (int from = 0; from < 64; ++from) {
         for (int to = 0; to < 64; ++to) {
             int merged = g_global_history[from][to] + (state.history[from][to] / 8);
@@ -2221,6 +2503,14 @@ int search_search(
     state.soft_ms = 0;
     state.hard_ms = 0;
     state.node_limit = 0;
+    state.rep_keys[0] = hash_position(pos);
+    state.move_stack[0] = invalid_move();
+
+    pthread_mutex_lock(&g_state_lock);
+    memcpy(state.killers, g_global_killers, sizeof(state.killers));
+    memcpy(state.history, g_global_history, sizeof(state.history));
+    memcpy(state.countermoves, g_global_countermoves, sizeof(state.countermoves));
+    pthread_mutex_unlock(&g_state_lock);
 
     return negamax(pos, depth, alpha, beta, &state, 0, best_move, -CHESS_BOT_INF, 1);
 }

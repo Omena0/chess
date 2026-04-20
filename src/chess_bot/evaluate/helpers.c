@@ -203,15 +203,31 @@ static int file_open_penalty(int own_pawns, int opp_pawns) {
     return 0;
 }
 
+static int chebyshev_distance(int a, int b) {
+    int ar = rank_of(a);
+    int af = file_of(a);
+    int br = rank_of(b);
+    int bf = file_of(b);
+    int dr = abs_i(ar - br);
+    int df = abs_i(af - bf);
+    return max_i(dr, df);
+}
+
 int eval_helpers_eval_position(const ChessPosition *pos, const ChessMoveList *legal_moves) {
     int score = 0;
 
     int white_pawns_by_file[8] = {0};
     int black_pawns_by_file[8] = {0};
+    int white_rooks_by_file[8] = {0};
+    int black_rooks_by_file[8] = {0};
     int white_king_sq = -1;
     int black_king_sq = -1;
+    int white_queen_sq = -1;
+    int black_queen_sq = -1;
     int white_bishops = 0;
     int black_bishops = 0;
+    int white_material = 0;
+    int black_material = 0;
     int phase = 0;
 
     for (int i = 0; i < 64; ++i) {
@@ -225,21 +241,31 @@ int eval_helpers_eval_position(const ChessPosition *pos, const ChessMoveList *le
 
         if (is_white_piece(p)) {
             score += val;
+            white_material += material;
             if (p == 'P') {
                 white_pawns_by_file[file_of(i)] += 1;
             } else if (p == 'K') {
                 white_king_sq = i;
+            } else if (p == 'Q') {
+                white_queen_sq = i;
             } else if (p == 'B') {
                 white_bishops += 1;
+            } else if (p == 'R') {
+                white_rooks_by_file[file_of(i)] += 1;
             }
         } else {
             score -= val;
+            black_material += material;
             if (p == 'p') {
                 black_pawns_by_file[file_of(i)] += 1;
             } else if (p == 'k') {
                 black_king_sq = i;
+            } else if (p == 'q') {
+                black_queen_sq = i;
             } else if (p == 'b') {
                 black_bishops += 1;
+            } else if (p == 'r') {
+                black_rooks_by_file[file_of(i)] += 1;
             }
         }
 
@@ -261,6 +287,105 @@ int eval_helpers_eval_position(const ChessPosition *pos, const ChessMoveList *le
             score += activity;
         } else {
             score -= activity;
+        }
+
+        int r = rank_of(i);
+        int f = file_of(i);
+
+        if (p == 'P') {
+            if (r < 7) {
+                if ((f > 0 && pos->board[((r + 1) * 8) + (f - 1)] == 'P') ||
+                    (f < 7 && pos->board[((r + 1) * 8) + (f + 1)] == 'P')) {
+                    score += 4;
+                }
+            }
+        } else if (p == 'p') {
+            if (r > 0) {
+                if ((f > 0 && pos->board[((r - 1) * 8) + (f - 1)] == 'p') ||
+                    (f < 7 && pos->board[((r - 1) * 8) + (f + 1)] == 'p')) {
+                    score -= 4;
+                }
+            }
+        }
+
+        if (p == 'N') {
+            int support = 0;
+            if (r < 7) {
+                if ((f > 0 && pos->board[((r + 1) * 8) + (f - 1)] == 'P') ||
+                    (f < 7 && pos->board[((r + 1) * 8) + (f + 1)] == 'P')) {
+                    support = 1;
+                }
+            }
+
+            int enemy_pawn_pressure = 0;
+            for (int rr = r - 1; rr >= 0 && !enemy_pawn_pressure; --rr) {
+                if (f > 0 && pos->board[(rr * 8) + (f - 1)] == 'p') {
+                    enemy_pawn_pressure = 1;
+                }
+                if (f < 7 && pos->board[(rr * 8) + (f + 1)] == 'p') {
+                    enemy_pawn_pressure = 1;
+                }
+            }
+
+            if (r <= 4 && support && !enemy_pawn_pressure) {
+                score += 16;
+            }
+        } else if (p == 'n') {
+            int support = 0;
+            if (r > 0) {
+                if ((f > 0 && pos->board[((r - 1) * 8) + (f - 1)] == 'p') ||
+                    (f < 7 && pos->board[((r - 1) * 8) + (f + 1)] == 'p')) {
+                    support = 1;
+                }
+            }
+
+            int enemy_pawn_pressure = 0;
+            for (int rr = r + 1; rr < 8 && !enemy_pawn_pressure; ++rr) {
+                if (f > 0 && pos->board[(rr * 8) + (f - 1)] == 'P') {
+                    enemy_pawn_pressure = 1;
+                }
+                if (f < 7 && pos->board[(rr * 8) + (f + 1)] == 'P') {
+                    enemy_pawn_pressure = 1;
+                }
+            }
+
+            if (r >= 3 && support && !enemy_pawn_pressure) {
+                score -= 16;
+            }
+        }
+
+        if (p != 'K' && p != 'k') {
+            int target_king = is_white_piece(p) ? black_king_sq : white_king_sq;
+            if (target_king >= 0) {
+                int dist = chebyshev_distance(i, target_king);
+                if (dist <= 3) {
+                    int weight = 0;
+                    switch ((char)tolower((unsigned char)p)) {
+                        case 'p':
+                            weight = 2;
+                            break;
+                        case 'n':
+                        case 'b':
+                            weight = 5;
+                            break;
+                        case 'r':
+                            weight = 7;
+                            break;
+                        case 'q':
+                            weight = 9;
+                            break;
+                        default:
+                            break;
+                    }
+
+                    int bonus = weight * (4 - dist);
+                    if (is_white_piece(p)) {
+                        score += bonus;
+                    } else {
+                        score -= bonus;
+                    }
+                }
+            }
         }
     }
 
@@ -296,6 +421,28 @@ int eval_helpers_eval_position(const ChessPosition *pos, const ChessMoveList *le
         if (black_isolated) {
             score += bp * 12;
         }
+
+        if (white_rooks_by_file[file] > 0) {
+            if (wp == 0 && bp == 0) {
+                score += white_rooks_by_file[file] * 20;
+            } else if (wp == 0) {
+                score += white_rooks_by_file[file] * 12;
+            }
+            if (white_rooks_by_file[file] >= 2) {
+                score += 14;
+            }
+        }
+
+        if (black_rooks_by_file[file] > 0) {
+            if (bp == 0 && wp == 0) {
+                score -= black_rooks_by_file[file] * 20;
+            } else if (bp == 0) {
+                score -= black_rooks_by_file[file] * 12;
+            }
+            if (black_rooks_by_file[file] >= 2) {
+                score -= 14;
+            }
+        }
     }
 
     for (int sq = 0; sq < 64; ++sq) {
@@ -304,11 +451,47 @@ int eval_helpers_eval_position(const ChessPosition *pos, const ChessMoveList *le
             if (is_passed_pawn(pos, sq, 1)) {
                 int rank_bonus = (6 - rank_of(sq));
                 score += 8 + (rank_bonus * 12);
+
+                int f = file_of(sq);
+                int r = rank_of(sq);
+                int connected = 0;
+                for (int df = -1; df <= 1; df += 2) {
+                    int ff = f + df;
+                    if (ff < 0 || ff > 7) {
+                        continue;
+                    }
+                    for (int rr = max_i(0, r - 1); rr <= min_i(7, r + 1); ++rr) {
+                        if (pos->board[(rr * 8) + ff] == 'P') {
+                            connected = 1;
+                        }
+                    }
+                }
+                if (connected) {
+                    score += 8 + (rank_bonus * 3);
+                }
             }
         } else if (p == 'p') {
             if (is_passed_pawn(pos, sq, 0)) {
                 int rank_bonus = (rank_of(sq) - 1);
                 score -= 8 + (rank_bonus * 12);
+
+                int f = file_of(sq);
+                int r = rank_of(sq);
+                int connected = 0;
+                for (int df = -1; df <= 1; df += 2) {
+                    int ff = f + df;
+                    if (ff < 0 || ff > 7) {
+                        continue;
+                    }
+                    for (int rr = max_i(0, r - 1); rr <= min_i(7, r + 1); ++rr) {
+                        if (pos->board[(rr * 8) + ff] == 'p') {
+                            connected = 1;
+                        }
+                    }
+                }
+                if (connected) {
+                    score -= 8 + (rank_bonus * 3);
+                }
             }
         }
     }
@@ -370,6 +553,45 @@ int eval_helpers_eval_position(const ChessPosition *pos, const ChessMoveList *le
 
     score -= white_uncastled_flank_pen;
     score += black_uncastled_flank_pen;
+
+    if (phase >= 16) {
+        if (white_queen_sq >= 0 && white_queen_sq != 59) {
+            int undeveloped = 0;
+            undeveloped += (pos->board[57] == 'N') ? 1 : 0;
+            undeveloped += (pos->board[62] == 'N') ? 1 : 0;
+            undeveloped += (pos->board[58] == 'B') ? 1 : 0;
+            undeveloped += (pos->board[61] == 'B') ? 1 : 0;
+            if (undeveloped >= 2) {
+                score -= 14 + (undeveloped * 2);
+            }
+        }
+
+        if (black_queen_sq >= 0 && black_queen_sq != 3) {
+            int undeveloped = 0;
+            undeveloped += (pos->board[1] == 'n') ? 1 : 0;
+            undeveloped += (pos->board[6] == 'n') ? 1 : 0;
+            undeveloped += (pos->board[2] == 'b') ? 1 : 0;
+            undeveloped += (pos->board[5] == 'b') ? 1 : 0;
+            if (undeveloped >= 2) {
+                score += 14 + (undeveloped * 2);
+            }
+        }
+    }
+
+    if (phase <= 6 && white_king_sq >= 0 && black_king_sq >= 0) {
+        int material_diff = white_material - black_material;
+        if (abs_i(material_diff) >= 300) {
+            if (material_diff > 0) {
+                int dist = chebyshev_distance(white_king_sq, black_king_sq);
+                int enemy_center = abs_i(rank_of(black_king_sq) - 3) + abs_i(file_of(black_king_sq) - 3);
+                score += (enemy_center * 6) + ((7 - dist) * 8);
+            } else {
+                int dist = chebyshev_distance(black_king_sq, white_king_sq);
+                int enemy_center = abs_i(rank_of(white_king_sq) - 3) + abs_i(file_of(white_king_sq) - 3);
+                score -= (enemy_center * 6) + ((7 - dist) * 8);
+            }
+        }
+    }
 
     if (legal_moves != NULL) {
         int mobility = legal_moves->count;
